@@ -2,22 +2,35 @@
 Counterfactual Dataset Curation & Multi-Task Instruction Formatting
 Paper: Hallucination-Resistant Bangla Visual Question Answering via Counterfactual Multi-Task Instruction Tuning
 
-Core Responsibilities:
-1. Dataset Loading: Load Bangla VQA data from Hugging Face or generate synthetic smoke-test data.
-2. Strict Image-Level Splitting: Partition unique images (80% Train, 10% Val, 10% Test) to prevent visual leakage.
-3. 70% Positive / 30% Counterfactual Negative Generation:
-   - Positives (70%): Original question & answer, with synthesized Bangla visual grounding statement.
-   - Negatives (30%): Borrow questions from distinct image clusters whose answers do not match the current image,
-     setting relevance='না', grounding='ছবিতে প্রশ্নে উল্লেখিত বস্তু বা প্রাসঙ্গিক প্রেক্ষাপট অনুপস্থিত।', and answer='ছবিতে এই তথ্যটি অনুপস্থিত।'
-4. Multi-Task Output Formatting: Export image files to data/images/{split}/ and JSONL files with multi-task conversation templates.
+Dataset Source: Remian9080/Bangla-Bayanno (Hugging Face Hub)
+Repo Structure:
+  - polar_dataset/qa.json (question_type='Polar', images in polar_dataset/images/{image_file})
+  - numeric_dataset/qa.json (question_type='Quantitative', images in numeric_dataset/images/{image_file})
+  - descriptive_dataset/qa.json (question_type='Descriptive', images in descriptive_dataset/images/{image_file})
+Each qa.json record format:
+  {'qa_id': int, 'image_id': int, 'image_file': str, 'question_bn': str, 'answer_bn': str}
+
+Key Pipeline Steps:
+1. Download 3 category qa.json files from Hugging Face Hub (hf_hub_download with urllib fallback).
+2. Group QA records by unique `image_id` and select a balanced subset up to `--subset_size` (default 10,000).
+3. Perform strict 80/10/10 image-level split by `image_id` (seed=42) to guarantee zero visual leakage.
+4. Download only the unique images needed for the selected split using ThreadPoolExecutor(max_workers=16).
+5. Apply 70% positive / 30% counterfactual negative curation and format multi-task instructions.
+6. Export data/{train,val,test}.jsonl and save outputs/results/dataset_statistics.csv.
+7. Support fast local verification via `--smoke_test`.
 """
 
 import argparse
-import hashlib
+import concurrent.futures
+import csv
 import json
 import os
 import random
+import shutil
 import sys
+import time
+import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -28,46 +41,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config_loader import ExperimentConfig, load_config
 
+# Optional Hugging Face Hub library import
+try:
+    from huggingface_hub import hf_hub_download
+    HAS_HF_HUB = True
+except ImportError:
+    hf_hub_download = None
+    HAS_HF_HUB = False
+
+
+DEFAULT_HF_REPO = "Remian9080/Bangla-Bayanno"
+
+DATASET_CATEGORIES = [
+    {
+        "folder": "polar_dataset",
+        "qa_file": "polar_dataset/qa.json",
+        "question_type": "Polar",
+    },
+    {
+        "folder": "numeric_dataset",
+        "qa_file": "numeric_dataset/qa.json",
+        "question_type": "Quantitative",
+    },
+    {
+        "folder": "descriptive_dataset",
+        "qa_file": "descriptive_dataset/qa.json",
+        "question_type": "Descriptive",
+    },
+]
+
 
 # ---------------------------------------------------------------------------
-# Bengali Question Classification & Grounding Synthesis
+# Bengali Visual Grounding Synthesis Templates
 # ---------------------------------------------------------------------------
-
-POLAR_KEYWORDS = ["কি ", " কি", "আছে কি", "হচ্ছে কি", "দেখা যাচ্ছে কি", "উপস্থিত কি", "নাকি", "সম্ভব কি"]
-POLAR_ANSWERS = ["হ্যাঁ", "না", "হাঁ", "জি", "জি না", "না, নেই", "হ্যাঁ, আছে"]
-
-QUANTITATIVE_KEYWORDS = ["কত", "কয়টি", "কয়জন", "কতগুলো", "সংখ্যা", "কয়টা", "কতজন", "কতখানি", "কতটুকু"]
-QUANTITATIVE_NUMERALS = ["০", "১", "২", "৩", "৪", "৫", "৬", "৭", "৮", "৯", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-
-
-def classify_bangla_question(question: str, answer: str = "") -> str:
-    """
-    Classifies a Bengali question into Quantitative, Polar, or Descriptive.
-    """
-    q_lower = question.strip()
-    a_lower = answer.strip()
-
-    # 1. Quantitative check
-    if any(kw in q_lower for kw in QUANTITATIVE_KEYWORDS):
-        return "Quantitative"
-    if any(char in a_lower for char in QUANTITATIVE_NUMERALS):
-        return "Quantitative"
-
-    # 2. Polar check
-    if a_lower in POLAR_ANSWERS:
-        return "Polar"
-    if any(kw in q_lower for kw in POLAR_KEYWORDS):
-        return "Polar"
-
-    # 3. Default to Descriptive
-    return "Descriptive"
-
 
 def synthesize_positive_grounding(question_type: str, answer: str) -> str:
     """
-    Generates a rule-based Bengali visual grounding rationale for factual samples.
+    Generates rule-based Bengali visual grounding rationale for factual positive samples.
     """
-    clean_ans = answer.strip()
+    clean_ans = str(answer).strip()
     if question_type == "Polar":
         return f"ছবিটি সতর্কতার সাথে পর্যবেক্ষণ করে প্রশ্নের প্রেক্ষাপট অনুযায়ী '{clean_ans}' সংক্রান্ত সুনির্দিষ্ট ভিজ্যুয়াল লক্ষণ শনাক্ত করা হয়েছে।"
     elif question_type == "Quantitative":
@@ -81,9 +93,563 @@ COUNTERFACTUAL_ANSWER = "ছবিতে এই তথ্যটি অনুপ�
 COUNTERFACTUAL_RELEVANCE = "না"
 POSITIVE_RELEVANCE = "হ্যাঁ"
 
+USER_PROMPT_TEMPLATE = (
+    "<image>\n"
+    "প্রশ্ন: {question}\n"
+    "উপরের ছবিটি বিশ্লেষণ করে প্রশ্নটির প্রাসঙ্গিকতা, ভিজ্যুয়াল প্রমাণ এবং চূড়ান্ত উত্তর বাংলায় প্রদান করুন।"
+)
+
+ASSISTANT_RESPONSE_TEMPLATE = (
+    "প্রাসঙ্গিকতা: {relevance}\n"
+    "ভিজ্যুয়াল প্রমাণ: {grounding}\n"
+    "চূড়ান্ত উত্তর: {answer}"
+)
+
 
 # ---------------------------------------------------------------------------
-# Synthetic Smoke-Test Sample Generator
+# Hugging Face Download Helper (hf_hub_download with robust urllib fallback)
+# ---------------------------------------------------------------------------
+
+def download_hf_file(
+    repo_id: str,
+    filename: str,
+    destination: Path,
+    max_retries: int = 3,
+) -> Path:
+    """
+    Downloads a single file from Hugging Face Hub dataset repo.
+    Uses hf_hub_download when available; otherwise falls back to direct HTTP streaming.
+    """
+    if destination.is_file() and destination.stat().st_size > 0:
+        return destination
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Attempt using hf_hub_download
+    if HAS_HF_HUB:
+        try:
+            cached_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+            )
+            if Path(cached_path).resolve() != destination.resolve():
+                shutil.copyfile(cached_path, destination)
+            return destination
+        except Exception:
+            pass  # Fall through to direct HTTP
+
+    # 2. HTTP download fallback
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+    temp_dest = destination.with_suffix(destination.suffix + ".tmp")
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Bangla-VQA-DataBuilder"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as response, open(temp_dest, "wb") as f_out:
+                shutil.copyfileobj(response, f_out)
+            temp_dest.replace(destination)
+            return destination
+        except Exception as e:
+            if temp_dest.is_file():
+                temp_dest.unlink()
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Failed to download '{url}' after {max_retries} attempts: {e}")
+            time.sleep(1.0 * (attempt + 1))
+    return destination
+
+
+# ---------------------------------------------------------------------------
+# Real Data Loader for Remian9080/Bangla-Bayanno
+# ---------------------------------------------------------------------------
+
+def load_bangla_bayanno_records(
+    repo_id: str = DEFAULT_HF_REPO,
+    raw_cache_dir: str = "data/raw",
+) -> List[Dict[str, Any]]:
+    """
+    Downloads and aggregates all QA records from the three dataset folders:
+    polar_dataset/qa.json, numeric_dataset/qa.json, and descriptive_dataset/qa.json.
+    """
+    cache_path = Path(raw_cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    all_records: List[Dict[str, Any]] = []
+
+    print(f"[data_builder] Fetching metadata from '{repo_id}' on Hugging Face Hub...")
+
+    for cat in DATASET_CATEGORIES:
+        folder = cat["folder"]
+        qa_file = cat["qa_file"]
+        q_type = cat["question_type"]
+
+        dest_qa_path = cache_path / qa_file
+        print(f"[data_builder] Downloading '{qa_file}'...")
+        download_hf_file(repo_id=repo_id, filename=qa_file, destination=dest_qa_path)
+
+        with open(dest_qa_path, "r", encoding="utf-8") as f:
+            cat_data = json.load(f)
+
+        print(f"[data_builder] Loaded {len(cat_data)} {q_type} items from '{qa_file}'.")
+
+        for item in cat_data:
+            img_file = item.get("image_file")
+            if not img_file and "image_id" in item:
+                img_file = f"COCO_train2014_{int(item['image_id']):012d}.jpg"
+            q_bn = item.get("question_bn") or item.get("image_bn")
+            a_bn = item.get("answer_bn")
+            if not img_file or not q_bn or a_bn is None:
+                continue
+
+            repo_img_path = f"{folder}/images/{img_file}"
+            all_records.append(
+                {
+                    "qa_id": item.get("qa_id", len(all_records)),
+                    "image_id": item["image_id"],
+                    "image_file": img_file,
+                    "repo_image_path": repo_img_path,
+                    "question_bn": q_bn,
+                    "answer_bn": a_bn,
+                    "question_type": q_type,
+                }
+            )
+
+    print(f"[data_builder] Aggregated {len(all_records)} total raw QA pairs across all categories.")
+    return all_records
+
+
+def select_balanced_image_subset(
+    records: List[Dict[str, Any]],
+    target_subset_size: int = 10000,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """
+    Groups QA records by unique image_id and selects a balanced subset of images
+    until total QA pairs reach approximately `target_subset_size`.
+    Ensures balanced representation across Polar, Quantitative, and Descriptive questions.
+    """
+    if target_subset_size <= 0 or target_subset_size >= len(records):
+        print(f"[data_builder] Using full dataset ({len(records)} QA pairs).")
+        return records
+
+    rng = random.Random(seed)
+
+    # Group records by image_id
+    by_image: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        by_image[r["image_id"]].append(r)
+
+    # Bucket unique images by question type present
+    quant_images = []
+    polar_images = []
+    desc_images = []
+
+    for img_id, items in by_image.items():
+        types = {it["question_type"] for it in items}
+        if "Quantitative" in types:
+            quant_images.append(img_id)
+        elif "Polar" in types:
+            polar_images.append(img_id)
+        else:
+            desc_images.append(img_id)
+
+    rng.shuffle(quant_images)
+    rng.shuffle(polar_images)
+    rng.shuffle(desc_images)
+
+    selected_image_ids: Set[int] = set()
+    selected_qa_count = 0
+
+    # Interleave image clusters from each question type bucket
+    i_q, i_p, i_d = 0, 0, 0
+    max_len = max(len(quant_images), len(polar_images), len(desc_images))
+
+    for step in range(max_len):
+        for bucket, idx in [
+            (quant_images, i_q),
+            (polar_images, i_p),
+            (desc_images, i_d),
+        ]:
+            if idx < len(bucket):
+                chosen_id = bucket[idx]
+                if chosen_id not in selected_image_ids:
+                    selected_image_ids.add(chosen_id)
+                    selected_qa_count += len(by_image[chosen_id])
+                if selected_qa_count >= target_subset_size:
+                    break
+        i_q += 1
+        i_p += 1
+        i_d += 1
+        if selected_qa_count >= target_subset_size:
+            break
+
+    selected_records = [r for r in records if r["image_id"] in selected_image_ids]
+    print(
+        f"[data_builder] Selected {len(selected_image_ids)} unique images "
+        f"({len(selected_records)} QA pairs, target ~{target_subset_size})."
+    )
+    return selected_records
+
+
+# ---------------------------------------------------------------------------
+# Strict Image-Level Splitting
+# ---------------------------------------------------------------------------
+
+def split_records_by_image(
+    records: List[Dict[str, Any]],
+    split_ratios: List[float] = [0.8, 0.1, 0.1],
+    seed: int = 42,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Partitions QA records by unique image_id with strict zero visual leakage.
+    Train: 80%, Val: 10%, Test: 10%.
+    """
+    rng = random.Random(seed)
+
+    by_image: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        by_image[r["image_id"]].append(r)
+
+    unique_images = sorted(list(by_image.keys()), key=lambda x: str(x))
+    rng.shuffle(unique_images)
+
+    total_imgs = len(unique_images)
+    n_train = max(1, int(total_imgs * split_ratios[0]))
+    n_val = max(1, int(total_imgs * split_ratios[1]))
+    if n_train + n_val >= total_imgs:
+        n_val = max(1, (total_imgs - n_train) // 2)
+    n_test = total_imgs - (n_train + n_val)
+    if n_test <= 0:
+        n_test = 1
+        n_train = max(1, total_imgs - n_val - n_test)
+
+    train_imgs = set(unique_images[:n_train])
+    val_imgs = set(unique_images[n_train : n_train + n_val])
+    test_imgs = set(unique_images[n_train + n_val :])
+
+    # Enforce disjoint partitions
+    assert train_imgs.isdisjoint(val_imgs), "Image leakage detected: Train and Val overlap!"
+    assert train_imgs.isdisjoint(test_imgs), "Image leakage detected: Train and Test overlap!"
+    assert val_imgs.isdisjoint(test_imgs), "Image leakage detected: Val and Test overlap!"
+
+    splits: Dict[str, List[Dict[str, Any]]] = {"train": [], "val": [], "test": []}
+    for img_id, items in by_image.items():
+        if img_id in train_imgs:
+            splits["train"].extend(items)
+        elif img_id in val_imgs:
+            splits["val"].extend(items)
+        else:
+            splits["test"].extend(items)
+
+    print(
+        f"[data_builder] Image-level split completed across {total_imgs} unique images:\n"
+        f"  - Train: {len(train_imgs)} images, {len(splits['train'])} QA pairs\n"
+        f"  - Val:   {len(val_imgs)} images, {len(splits['val'])} QA pairs\n"
+        f"  - Test:  {len(test_imgs)} images, {len(splits['test'])} QA pairs"
+    )
+    return splits
+
+
+# ---------------------------------------------------------------------------
+# Concurrent Image Downloader for Real Dataset
+# ---------------------------------------------------------------------------
+
+def download_images_for_split(
+    split_name: str,
+    split_records: List[Dict[str, Any]],
+    output_dir: Path,
+    repo_id: str,
+    max_workers: int = 16,
+) -> Dict[str, str]:
+    """
+    Downloads only the unique images required for a split concurrently.
+    Saves them directly into data/images/{split_name}/{image_file}.
+    Returns a mapping of image_file -> relative disk path.
+    """
+    images_dir = output_dir / "images" / split_name
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Deduplicate unique images needed for this split
+    unique_images_map: Dict[str, str] = {}
+    for r in split_records:
+        img_file = r["image_file"]
+        if img_file not in unique_images_map:
+            unique_images_map[img_file] = r["repo_image_path"]
+
+    total_images = len(unique_images_map)
+    print(f"[data_builder] Concurrently downloading {total_images} unique images for '{split_name}' (workers={max_workers})...")
+
+    def _download_task(img_file: str, repo_img_path: str) -> Tuple[str, str]:
+        dest_path = images_dir / img_file
+        # Check if already downloaded
+        if not (dest_path.is_file() and dest_path.stat().st_size > 0):
+            try:
+                download_hf_file(repo_id=repo_id, filename=repo_img_path, destination=dest_path)
+            except Exception:
+                # If path failed in current folder, fallback to alternative folder paths
+                alt_folders = ["polar_dataset", "numeric_dataset", "descriptive_dataset"]
+                downloaded = False
+                for f_alt in alt_folders:
+                    alt_repo_path = f"{f_alt}/images/{img_file}"
+                    try:
+                        download_hf_file(repo_id=repo_id, filename=alt_repo_path, destination=dest_path)
+                        downloaded = True
+                        break
+                    except Exception:
+                        continue
+                if not downloaded:
+                    print(f"[data_builder] WARNING: Could not download image '{img_file}' from HF.")
+        rel_path = f"{output_dir.name}/images/{split_name}/{img_file}"
+        return img_file, rel_path
+
+    path_mapping: Dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_img = {
+            executor.submit(_download_task, img_file, repo_path): img_file
+            for img_file, repo_path in unique_images_map.items()
+        }
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_img):
+            img_file, rel_path = future.result()
+            path_mapping[img_file] = rel_path
+            completed += 1
+            if completed % 500 == 0 or completed == total_images:
+                print(f"[data_builder] [{split_name}] Downloaded {completed}/{total_images} images...")
+
+    return path_mapping
+
+
+# ---------------------------------------------------------------------------
+# 70% Positive / 30% Counterfactual Negative Curation
+# ---------------------------------------------------------------------------
+
+def apply_counterfactual_curation(
+    split_records: List[Dict[str, Any]],
+    image_paths_map: Dict[str, str],
+    positive_ratio: float = 0.70,
+    seed: int = 42,
+    all_records: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Curates 70% Positive and 30% Counterfactual Negative samples.
+    Borrow questions from different image clusters whose ground-truth answers do not match.
+    """
+    if not split_records:
+        return []
+
+    rng = random.Random(seed)
+
+    by_image: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for r in split_records:
+        by_image[r["image_id"]].append(r)
+
+    all_image_ids = list(by_image.keys())
+    curated_samples: List[Dict[str, Any]] = []
+
+    for img_id, items in by_image.items():
+        current_answers = {str(item["answer_bn"]).strip().lower() for item in items}
+
+        # Build negative candidate pool from other image clusters in split
+        other_ids = [o_id for o_id in all_image_ids if o_id != img_id]
+        candidate_pool: List[Dict[str, Any]] = []
+        for o_id in other_ids:
+            for candidate in by_image[o_id]:
+                cand_ans = str(candidate["answer_bn"]).strip().lower()
+                if cand_ans not in current_answers:
+                    candidate_pool.append(candidate)
+
+        # Fallback to candidates from full dataset if split has only 1 image cluster
+        if not candidate_pool and all_records:
+            for candidate in all_records:
+                if candidate["image_id"] != img_id:
+                    cand_ans = str(candidate["answer_bn"]).strip().lower()
+                    if cand_ans not in current_answers:
+                        candidate_pool.append(candidate)
+
+        items_copy = list(items)
+        rng.shuffle(items_copy)
+
+        n_total = len(items_copy)
+        n_pos = max(1, round(n_total * positive_ratio))
+        if n_pos >= n_total and n_total > 1:
+            n_pos = n_total - 1
+
+        for i, record in enumerate(items_copy):
+            is_pos = i < n_pos or not candidate_pool
+            img_file = record["image_file"]
+            resolved_img_path = image_paths_map.get(img_file, f"data/images/{img_file}")
+
+            if is_pos:
+                q_type = record["question_type"]
+                grounding = synthesize_positive_grounding(q_type, record["answer_bn"])
+                curated_samples.append(
+                    {
+                        "image_id": record["image_id"],
+                        "image_path": resolved_img_path,
+                        "question": record["question_bn"],
+                        "question_type": q_type,
+                        "is_answerable": True,
+                        "relevance": POSITIVE_RELEVANCE,
+                        "grounding": grounding,
+                        "answer": record["answer_bn"],
+                    }
+                )
+            else:
+                borrowed = rng.choice(candidate_pool)
+                curated_samples.append(
+                    {
+                        "image_id": record["image_id"],
+                        "image_path": resolved_img_path,
+                        "question": borrowed["question_bn"],
+                        "question_type": borrowed["question_type"],
+                        "is_answerable": False,
+                        "relevance": COUNTERFACTUAL_RELEVANCE,
+                        "grounding": COUNTERFACTUAL_GROUNDING,
+                        "answer": COUNTERFACTUAL_ANSWER,
+                    }
+                )
+
+    rng.shuffle(curated_samples)
+    return curated_samples
+
+
+# ---------------------------------------------------------------------------
+# Multi-Task JSONL Formatting & Export
+# ---------------------------------------------------------------------------
+
+def export_split_jsonl(
+    samples: List[Dict[str, Any]],
+    split_name: str,
+    output_dir: Path,
+) -> Path:
+    """
+    Exports samples to data/{split_name}.jsonl matching the multi-task conversation format.
+    """
+    jsonl_path = output_dir / f"{split_name}.jsonl"
+    records = []
+
+    for idx, s in enumerate(samples, start=1):
+        sample_id = f"{split_name}_{idx:04d}"
+        user_val = USER_PROMPT_TEMPLATE.format(question=s["question"])
+        assistant_val = ASSISTANT_RESPONSE_TEMPLATE.format(
+            relevance=s["relevance"],
+            grounding=s["grounding"],
+            answer=s["answer"],
+        )
+
+        record = {
+            "sample_id": sample_id,
+            "image_path": s["image_path"],
+            "question": s["question"],
+            "question_type": s["question_type"],
+            "is_answerable": s["is_answerable"],
+            "grounding": s["grounding"],
+            "answer": s["answer"],
+            "conversations": [
+                {"from": "user", "value": user_val},
+                {"from": "assistant", "value": assistant_val},
+            ],
+        }
+        records.append(record)
+
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"[data_builder] Successfully exported {len(records)} samples to '{jsonl_path}'")
+    return jsonl_path
+
+
+def save_dataset_statistics_csv(
+    curated_splits: Dict[str, List[Dict[str, Any]]],
+    output_csv_path: str = "outputs/results/dataset_statistics.csv",
+) -> None:
+    """
+    Saves a comprehensive breakdown table to outputs/results/dataset_statistics.csv
+    """
+    csv_file = Path(output_csv_path)
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "Split",
+        "Unique_Images",
+        "Total_Samples",
+        "Positive_Samples",
+        "Counterfactual_Samples",
+        "Polar",
+        "Quantitative",
+        "Descriptive",
+    ]
+
+    rows = []
+    tot_imgs, tot_samples, tot_pos, tot_cf, tot_polar, tot_quant, tot_desc = 0, 0, 0, 0, 0, 0, 0
+
+    for split_name in ["train", "val", "test"]:
+        items = curated_splits.get(split_name, [])
+        u_imgs = len({it["image_id"] for it in items})
+        t_samples = len(items)
+        pos = sum(1 for it in items if it["is_answerable"])
+        cf = sum(1 for it in items if not it["is_answerable"])
+        polar = sum(1 for it in items if it["question_type"] == "Polar")
+        quant = sum(1 for it in items if it["question_type"] == "Quantitative")
+        desc = sum(1 for it in items if it["question_type"] == "Descriptive")
+
+        tot_imgs += u_imgs
+        tot_samples += t_samples
+        tot_pos += pos
+        tot_cf += cf
+        tot_polar += polar
+        tot_quant += quant
+        tot_desc += desc
+
+        rows.append(
+            {
+                "Split": split_name,
+                "Unique_Images": u_imgs,
+                "Total_Samples": t_samples,
+                "Positive_Samples": pos,
+                "Counterfactual_Samples": cf,
+                "Polar": polar,
+                "Quantitative": quant,
+                "Descriptive": desc,
+            }
+        )
+
+    # Total row
+    rows.append(
+        {
+            "Split": "Total",
+            "Unique_Images": tot_imgs,
+            "Total_Samples": tot_samples,
+            "Positive_Samples": tot_pos,
+            "Counterfactual_Samples": tot_cf,
+            "Polar": tot_polar,
+            "Quantitative": tot_quant,
+            "Descriptive": tot_desc,
+        }
+    )
+
+    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\n[data_builder] Dataset statistics written to: {csv_file}")
+    print("=" * 86)
+    print(f"{'Split':<8} | {'Images':<7} | {'Total':<7} | {'Positive':<9} | {'Counterfactual':<15} | {'Polar':<6} | {'Quant':<6} | {'Desc':<6}")
+    print("-" * 86)
+    for r in rows:
+        print(
+            f"{r['Split']:<8} | {r['Unique_Images']:<7} | {r['Total_Samples']:<7} | "
+            f"{r['Positive_Samples']:<9} | {r['Counterfactual_Samples']:<15} | "
+            f"{r['Polar']:<6} | {r['Quantitative']:<6} | {r['Descriptive']:<6}"
+        )
+    print("=" * 86 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic Smoke-Test (Fast Offline Verification)
 # ---------------------------------------------------------------------------
 
 SMOKE_TEST_SCENES = [
@@ -137,602 +703,183 @@ SMOKE_TEST_SCENES = [
             ("নদীর পানির রং কেমন?", "নীলাভ ও স্বচ্ছ", "Descriptive"),
         ],
     },
-    {
-        "bg_color": (255, 250, 240),
-        "shape": ("rectangle", (50, 50, 170, 170), (70, 70, 70)),
-        "qa_pairs": [
-            ("টেবিলে কয়টি খোলা ল্যাপটপ আছে?", "১টি", "Quantitative"),
-            ("ল্যাপটপের পর্দা কি চালু আছে?", "হ্যাঁ", "Polar"),
-            ("ল্যাপটপটি কোথায় স্থাপন করা হয়েছে?", "অফিসের ডেস্কে", "Descriptive"),
-            ("ডেস্কে কি কোনো কফি মগ আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (255, 235, 235),
-        "shape": ("circle", (70, 70, 150, 150), (200, 30, 30)),
-        "qa_pairs": [
-            ("প্লেটে কয়টি লাল আপেল রয়েছে?", "২টি", "Quantitative"),
-            ("আপেলটি কি তাজা দেখা যাচ্ছে?", "হ্যাঁ", "Polar"),
-            ("ফলটি কোন পাত্রে রাখা হয়েছে?", "সাদা প্লেটে", "Descriptive"),
-            ("প্লেটে কি কোনো কলা রয়েছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (230, 240, 230),
-        "shape": ("rectangle", (40, 60, 180, 160), (100, 149, 237)),
-        "qa_pairs": [
-            ("শ্রেণীকক্ষে কয়টি ব্ল্যাকবোর্ড আছে?", "১টি", "Quantitative"),
-            ("বোর্ডে কি কিছু লেখা আছে?", "হ্যাঁ", "Polar"),
-            ("বোর্ডটি কোথায় টাঙানো হয়েছে?", "দেয়ালের ওপর", "Descriptive"),
-            ("কক্ষে কি প্রজেক্টর চালু আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (240, 255, 255),
-        "shape": ("circle", (50, 50, 170, 170), (255, 215, 0)),
-        "qa_pairs": [
-            ("আকাশে কি সূর্য দেখা যাচ্ছে?", "হ্যাঁ", "Polar"),
-            ("সূর্যের আভা কেমন?", "উজ্জ্বল সোনালী", "Descriptive"),
-            ("আকাশে কয়টি সূর্য দৃশ্যমান?", "১টি", "Quantitative"),
-            ("আকাশে কি ঘন কালো মেঘ আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (245, 245, 245),
-        "shape": ("rectangle", (60, 50, 160, 170), (160, 82, 45)),
-        "qa_pairs": [
-            ("ছবিতে কয়টি কাঠের চেয়ার দৃশ্যমান?", "১টি", "Quantitative"),
-            ("চেয়ারটি কি কাঠের তৈরি?", "হ্যাঁ", "Polar"),
-            ("চেয়ারের ওপর কি কেউ বসে আছে?", "না", "Polar"),
-            ("চেয়ারটির অবস্থান কোথায়?", "ঘরের কোণে", "Descriptive"),
-        ],
-    },
-    {
-        "bg_color": (235, 245, 235),
-        "shape": ("polygon", [(110, 40), (170, 160), (50, 160)], (46, 139, 87)),
-        "qa_pairs": [
-            ("ছবিতে কয়টি পর্বতশৃঙ্গ দৃশ্যমান?", "১টি", "Quantitative"),
-            ("পাহাড়ের গায়ে কি গাছপালা আছে?", "হ্যাঁ", "Polar"),
-            ("পাহাড়ের চূড়া দেখতে কেমন?", "খাড়া ও সূক্ষ্ম", "Descriptive"),
-            ("পাহাড়ে কি বরফ জমে আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (255, 240, 245),
-        "shape": ("circle", (60, 60, 160, 160), (219, 112, 147)),
-        "qa_pairs": [
-            ("ফুলদানিতে কয়টি গোলাপ ফুল আছে?", "৪টি", "Quantitative"),
-            ("গোলাপের পাপড়ির রং কি গোলাপী?", "হ্যাঁ", "Polar"),
-            ("ফুলগুলো কোথায় সাজানো?", "কাঁচের ফুলদানিতে", "Descriptive"),
-            ("ফুলদানিতে কি কোনো পদ্ম ফুল আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (240, 240, 250),
-        "shape": ("rectangle", (50, 70, 170, 150), (112, 128, 144)),
-        "qa_pairs": [
-            ("রাস্তায় কয়টি বাস চলাচল করছে?", "১টি", "Quantitative"),
-            ("বাসটি কি গতিশীল অবস্থায় রয়েছে?", "হ্যাঁ", "Polar"),
-            ("বাসটির রং কেমন?", "ধূসর ও নীল", "Descriptive"),
-            ("বাসের ছাদে কি কোনো যাত্রী আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (250, 250, 230),
-        "shape": ("circle", (70, 70, 150, 150), (255, 140, 0)),
-        "qa_pairs": [
-            ("গাছের ডালে কয়টি পাখি বসে আছে?", "২টি", "Quantitative"),
-            ("পাখিগুলোর পালকের রং কি কমলা?", "হ্যাঁ", "Polar"),
-            ("পাখিগুলো কি উড়ন্ত অবস্থায় আছে?", "না", "Polar"),
-            ("পাখির ঠোঁট দেখতে কেমন?", "ধারালো ও ছোট", "Descriptive"),
-        ],
-    },
-    {
-        "bg_color": (230, 250, 250),
-        "shape": ("rectangle", (60, 40, 160, 180), (0, 128, 128)),
-        "qa_pairs": [
-            ("ঘরে কয়টি বুকশেলফ রয়েছে?", "১টি", "Quantitative"),
-            ("শেলফে কি অনেকগুলো বই সাজানো আছে?", "হ্যাঁ", "Polar"),
-            ("শেলফটি কোথায় অবস্থিত?", "লাইব্রেরির দেয়ালে", "Descriptive"),
-            ("শেলফের ওপর কি টেলিভিশন আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (255, 248, 220),
-        "shape": ("circle", (80, 80, 140, 140), (218, 165, 32)),
-        "qa_pairs": [
-            ("থালায় কয়টি মিষ্টি সাজানো আছে?", "৫টি", "Quantitative"),
-            ("মিষ্টিগুলোর রং কি সোনালী?", "হ্যাঁ", "Polar"),
-            ("মিষ্টিগুলো কোন পাত্রে রাখা?", "পিতলের থালায়", "Descriptive"),
-            ("থালায় কি কোনো নোনতা খাবার আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (240, 255, 240),
-        "shape": ("rectangle", (70, 60, 150, 160), (85, 107, 47)),
-        "qa_pairs": [
-            ("ছবিতে কয়টি সাইকেল দেখা যাচ্ছে?", "১টি", "Quantitative"),
-            ("সাইকেলে কি দুটি চাকা আছে?", "হ্যাঁ", "Polar"),
-            ("সাইকেলটি কোথায় রাখা হয়েছে?", "ফুটপাতের পাশে", "Descriptive"),
-            ("সাইকেলের সাথে কি কোনো মোটর ইঞ্জিন আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (245, 240, 255),
-        "shape": ("polygon", [(110, 50), (170, 170), (50, 170)], (147, 112, 219)),
-        "qa_pairs": [
-            ("ছবিতে কয়টি তাবু দৃশ্যমান?", "১টি", "Quantitative"),
-            ("তাবুটি কি পাহাড়ি সমতলে খাটানো হয়েছে?", "হ্যাঁ", "Polar"),
-            ("তাবুর রং কি বেগুনি?", "হ্যাঁ", "Polar"),
-            ("তাবুর ভেতরে কি আলো জ্বলছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (255, 240, 240),
-        "shape": ("rectangle", (50, 50, 170, 170), (178, 34, 34)),
-        "qa_pairs": [
-            ("ছবিতে কয়টি লাল ইট দেখা যাচ্ছে?", "৬টি", "Quantitative"),
-            ("ইটগুলো কি একটি আরেকটির ওপর স্তূপ করা?", "হ্যাঁ", "Polar"),
-            ("ইটের উপরিভাগ কেমন?", "শক্ত ও রুক্ষ", "Descriptive"),
-            ("ইটের গায়ে কি কোনো জলছাপ আছে?", "না", "Polar"),
-        ],
-    },
-    {
-        "bg_color": (230, 245, 255),
-        "shape": ("circle", (70, 70, 150, 150), (30, 144, 255)),
-        "qa_pairs": [
-            ("আকাশে কয়টি ঘুড়ি উড়ছে?", "৩টি", "Quantitative"),
-            ("ঘুড়িগুলো কি রঙিন?", "হ্যাঁ", "Polar"),
-            ("ঘুড়িগুলো কোথায় উড়ছে?", "উন্মুক্ত খোলা আকাশে", "Descriptive"),
-            ("আকাশে কি হেলিকপ্টার উড়ছে?", "না", "Polar"),
-        ],
-    },
 ]
 
 
-def create_synthetic_image(scene_def: Dict[str, Any], size: Tuple[int, int] = (224, 224)) -> Image.Image:
-    """Creates a distinct synthetic RGB PIL image for smoke testing."""
-    img = Image.new("RGB", size, color=scene_def["bg_color"])
-    draw = ImageDraw.Draw(img)
-    shape_type, coords, fill_color = scene_def["shape"]
-    if shape_type == "rectangle":
-        draw.rectangle(coords, fill=fill_color, outline=(20, 20, 20), width=2)
-    elif shape_type == "circle":
-        draw.ellipse(coords, fill=fill_color, outline=(20, 20, 20), width=2)
-    elif shape_type == "polygon":
-        draw.polygon(coords, fill=fill_color, outline=(20, 20, 20))
-    return img
-
-
-def generate_smoke_test_dataset(num_samples: int = 100) -> List[Dict[str, Any]]:
-    """
-    Generates synthetic Bangla VQA data structured by image clusters.
-    """
-    print(f"[data_builder] Generating {num_samples} synthetic smoke-test samples across 20 scenes...")
-    samples = []
-    sample_counter = 0
-
-    # Repeat or cycle through scenes until we hit desired sample count
-    scene_idx = 0
-    while len(samples) < num_samples:
-        scene = SMOKE_TEST_SCENES[scene_idx % len(SMOKE_TEST_SCENES)]
-        image_id = f"smoke_img_{scene_idx:03d}"
-        pil_image = create_synthetic_image(scene)
-
-        for q, a, q_type in scene["qa_pairs"]:
-            if len(samples) >= num_samples:
-                break
-            sample_counter += 1
-            samples.append(
-                {
-                    "sample_uid": f"raw_{sample_counter:04d}",
-                    "image_id": image_id,
-                    "image": pil_image,
-                    "question": q,
-                    "answer": a,
-                    "question_type": q_type,
-                }
-            )
-        scene_idx += 1
-
-    print(f"[data_builder] Generated {len(samples)} raw samples across {scene_idx} unique images.")
-    return samples
-
-
-# ---------------------------------------------------------------------------
-# Hugging Face Dataset Loader
-# ---------------------------------------------------------------------------
-
-def load_huggingface_dataset(
-    hf_dataset_id: str,
-    subset_size: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Attempts to load a dataset from Hugging Face datasets library with automatic fallback.
-    """
-    print(f"[data_builder] Attempting to load '{hf_dataset_id}' from Hugging Face Hub...")
-    try:
-        from datasets import load_dataset
-        ds = load_dataset(hf_dataset_id, split="train")
-        if subset_size and len(ds) > subset_size:
-            ds = ds.select(range(subset_size))
-
-        samples = []
-        for idx, item in enumerate(ds):
-            # Extract image
-            img = item.get("image")
-            if img is None:
-                continue
-
-            # Determine unique image identifier
-            if hasattr(img, "filename") and img.filename:
-                image_id = Path(img.filename).stem
-            else:
-                image_id = f"hf_img_{idx:05d}"
-
-            q = item.get("question") or item.get("question_bn") or item.get("query") or ""
-            a = item.get("answer") or item.get("answer_bn") or item.get("label") or ""
-            q_type = item.get("question_type") or classify_bangla_question(q, a)
-
-            samples.append(
-                {
-                    "sample_uid": f"hf_{idx:05d}",
-                    "image_id": image_id,
-                    "image": img,
-                    "question": q,
-                    "answer": a,
-                    "question_type": q_type,
-                }
-            )
-
-        print(f"[data_builder] Successfully loaded {len(samples)} samples from Hugging Face.")
-        return samples
-
-    except Exception as e:
-        print(f"[data_builder] WARNING: Could not load '{hf_dataset_id}' from Hugging Face Hub: {e}")
-        print("[data_builder] Falling back to synthetic smoke-test dataset generation.")
-        return generate_smoke_test_dataset(num_samples=100)
-
-
-# ---------------------------------------------------------------------------
-# Strict Image-Level Splitting
-# ---------------------------------------------------------------------------
-
-def split_by_image(
-    samples: List[Dict[str, Any]],
+def run_smoke_test_pipeline(
+    output_dir: Path,
     split_ratios: List[float] = [0.8, 0.1, 0.1],
-    seed: int = 42,
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Strict Image-Level Splitting:
-    Groups all QA pairs by unique image_id, splits image IDs deterministically,
-    ensuring 0% image overlap across Train, Validation, and Test partitions.
-    """
-    rng = random.Random(seed)
-
-    # Group samples by image_id
-    grouped_by_image: Dict[str, List[Dict[str, Any]]] = {}
-    for s in samples:
-        img_id = s["image_id"]
-        if img_id not in grouped_by_image:
-            grouped_by_image[img_id] = []
-        grouped_by_image[img_id].append(s)
-
-    unique_images = sorted(list(grouped_by_image.keys()))
-    rng.shuffle(unique_images)
-
-    total_images = len(unique_images)
-    n_train = max(1, int(total_images * split_ratios[0]))
-    n_val = max(1, int(total_images * split_ratios[1]))
-    # Remainder goes to test
-    if n_train + n_val >= total_images:
-        n_val = max(1, (total_images - n_train) // 2)
-    n_test = total_images - (n_train + n_val)
-    if n_test <= 0:
-        n_test = 1
-        n_train = max(1, total_images - n_val - n_test)
-
-    train_imgs = set(unique_images[:n_train])
-    val_imgs = set(unique_images[n_train : n_train + n_val])
-    test_imgs = set(unique_images[n_train + n_val :])
-
-    # Assert strict zero image overlap
-    assert train_imgs.isdisjoint(val_imgs), "Image leakage detected between Train and Val!"
-    assert train_imgs.isdisjoint(test_imgs), "Image leakage detected between Train and Test!"
-    assert val_imgs.isdisjoint(test_imgs), "Image leakage detected between Val and Test!"
-
-    splits: Dict[str, List[Dict[str, Any]]] = {"train": [], "val": [], "test": []}
-    for img_id, item_list in grouped_by_image.items():
-        if img_id in train_imgs:
-            splits["train"].extend(item_list)
-        elif img_id in val_imgs:
-            splits["val"].extend(item_list)
-        else:
-            splits["test"].extend(item_list)
-
-    print(
-        f"[data_builder] Image-level split completed (Total images: {total_images}):\n"
-        f"  - Train: {len(train_imgs)} images, {len(splits['train'])} samples\n"
-        f"  - Val:   {len(val_imgs)} images, {len(splits['val'])} samples\n"
-        f"  - Test:  {len(test_imgs)} images, {len(splits['test'])} samples"
-    )
-    return splits
-
-
-# ---------------------------------------------------------------------------
-# 70% Positive / 30% Counterfactual Negative Generation
-# ---------------------------------------------------------------------------
-
-def apply_counterfactual_augmentation(
-    split_samples: List[Dict[str, Any]],
     positive_ratio: float = 0.70,
     seed: int = 42,
-) -> List[Dict[str, Any]]:
-    """
-    Applies 70% Positive / 30% Counterfactual Negative curation per partition.
-
-    - 70% Positive (is_answerable = True):
-      Keeps original QA and synthesizes Bengali visual grounding.
-    - 30% Negative (is_answerable = False):
-      Picks a question from a different image cluster in the same split
-      whose ground-truth answer does NOT match any answer in the current image's QA list.
-      Sets relevance="না", grounding="ছবিতে প্রশ্নে উল্লেখিত বস্তু বা প্রাসঙ্গিক প্রেক্ষাপট অনুপস্থিত।",
-      and answer="ছবিতে এই তথ্যটি অনুপস্থিত।"
-    """
-    if not split_samples:
-        return []
-
+) -> Dict[str, Path]:
+    """Fast local synthetic pipeline producing 100 samples across 25 scenes."""
+    print("[data_builder] Running Fast Local Synthetic Smoke Test...")
     rng = random.Random(seed)
 
-    # Group by image_id for cluster-aware candidate matching
-    by_image: Dict[str, List[Dict[str, Any]]] = {}
-    for s in split_samples:
-        img_id = s["image_id"]
-        if img_id not in by_image:
-            by_image[img_id] = []
-        by_image[img_id].append(s)
+    raw_samples = []
+    sample_counter = 0
+    images_by_id: Dict[str, Image.Image] = {}
 
-    all_image_ids = list(by_image.keys())
+    for scene_idx in range(25):
+        scene = SMOKE_TEST_SCENES[scene_idx % len(SMOKE_TEST_SCENES)]
+        img_id = f"smoke_img_{scene_idx:03d}"
+        img = Image.new("RGB", (224, 224), color=scene["bg_color"])
+        draw = ImageDraw.Draw(img)
+        shape_type, coords, fill_color = scene["shape"]
+        if shape_type == "rectangle":
+            draw.rectangle(coords, fill=fill_color, outline=(20, 20, 20), width=2)
+        elif shape_type == "circle":
+            draw.ellipse(coords, fill=fill_color, outline=(20, 20, 20), width=2)
+        elif shape_type == "polygon":
+            draw.polygon(coords, fill=fill_color, outline=(20, 20, 20))
+        images_by_id[img_id] = img
 
-    augmented_results: List[Dict[str, Any]] = []
+        for q, a, q_type in scene["qa_pairs"]:
+            sample_counter += 1
+            raw_samples.append(
+                {
+                    "qa_id": sample_counter,
+                    "image_id": img_id,
+                    "image_file": f"{img_id}.jpg",
+                    "question_bn": q,
+                    "answer_bn": a,
+                    "question_type": q_type,
+                }
+            )
 
-    for img_id, items in by_image.items():
-        # Answers associated with this specific image
-        current_image_answers = {item["answer"].strip().lower() for item in items}
+    splits = split_records_by_image(raw_samples, split_ratios=split_ratios, seed=seed)
+    curated_splits: Dict[str, List[Dict[str, Any]]] = {}
+    exported_paths: Dict[str, Path] = {}
 
-        # Build candidate negative questions pool from other images
-        other_img_ids = [other_id for other_id in all_image_ids if other_id != img_id]
-        candidate_pool: List[Dict[str, Any]] = []
-        for other_id in other_img_ids:
-            for candidate in by_image[other_id]:
-                if candidate["answer"].strip().lower() not in current_image_answers:
-                    candidate_pool.append(candidate)
+    for split_name, records in splits.items():
+        img_dir = output_dir / "images" / split_name
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_path_map: Dict[str, str] = {}
 
-        # Shuffle current items
-        items_copy = list(items)
-        rng.shuffle(items_copy)
+        for r in records:
+            img_file = r["image_file"]
+            img_id = r["image_id"]
+            disk_path = img_dir / img_file
+            if not disk_path.is_file():
+                images_by_id[img_id].save(disk_path, format="JPEG", quality=95)
+            img_path_map[img_file] = f"{output_dir.name}/images/{split_name}/{img_file}"
 
-        # Compute number of positive vs negative samples for this image cluster
-        n_total = len(items_copy)
-        n_pos = max(1, round(n_total * positive_ratio))
-        if n_pos >= n_total and n_total > 1:
-            n_pos = n_total - 1
-
-        for i, sample in enumerate(items_copy):
-            is_positive = i < n_pos or not candidate_pool
-
-            if is_positive:
-                q_type = sample.get("question_type") or classify_bangla_question(sample["question"], sample["answer"])
-                grounding = synthesize_positive_grounding(q_type, sample["answer"])
-                augmented_results.append(
-                    {
-                        "image_id": sample["image_id"],
-                        "image": sample["image"],
-                        "question": sample["question"],
-                        "question_type": q_type,
-                        "is_answerable": True,
-                        "relevance": POSITIVE_RELEVANCE,
-                        "grounding": grounding,
-                        "answer": sample["answer"],
-                    }
-                )
-            else:
-                # Counterfactual Negative
-                borrowed = rng.choice(candidate_pool)
-                q_type = borrowed.get("question_type") or classify_bangla_question(borrowed["question"], borrowed["answer"])
-                augmented_results.append(
-                    {
-                        "image_id": sample["image_id"],
-                        "image": sample["image"],
-                        "question": borrowed["question"],
-                        "question_type": q_type,
-                        "is_answerable": False,
-                        "relevance": COUNTERFACTUAL_RELEVANCE,
-                        "grounding": COUNTERFACTUAL_GROUNDING,
-                        "answer": COUNTERFACTUAL_ANSWER,
-                    }
-                )
-
-    rng.shuffle(augmented_results)
-    return augmented_results
-
-
-# ---------------------------------------------------------------------------
-# Multi-Task Instruction Formatting & Export
-# ---------------------------------------------------------------------------
-
-USER_PROMPT_TEMPLATE = (
-    "<image>\n"
-    "প্রশ্ন: {question}\n"
-    "উপরের ছবিটি বিশ্লেষণ করে প্রশ্নটির প্রাসঙ্গিকতা, ভিজ্যুয়াল প্রমাণ এবং চূড়ান্ত উত্তর বাংলায় প্রদান করুন।"
-)
-
-ASSISTANT_RESPONSE_TEMPLATE = (
-    "প্রাসঙ্গিকতা: {relevance}\n"
-    "ভিজ্যুয়াল প্রমাণ: {grounding}\n"
-    "চূড়ান্ত উত্তর: {answer}"
-)
-
-
-def format_and_export_split(
-    samples: List[Dict[str, Any]],
-    split_name: str,
-    output_dir: Path,
-) -> Path:
-    """
-    Saves image files to data/images/{split_name}/ and exports data/{split_name}.jsonl
-    with multi-task conversation format.
-    """
-    images_dir = output_dir / "images" / split_name
-    images_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = output_dir / f"{split_name}.jsonl"
-
-    exported_records = []
-    saved_images_cache: Dict[str, str] = {}
-
-    for idx, sample in enumerate(samples, start=1):
-        sample_id = f"{split_name}_{idx:04d}"
-        img_id = sample["image_id"]
-
-        # Cache image saving per unique image
-        if img_id not in saved_images_cache:
-            img_filename = f"{img_id}.jpg"
-            img_disk_path = images_dir / img_filename
-            pil_image = sample["image"]
-            if isinstance(pil_image, Image.Image):
-                pil_image.save(img_disk_path, format="JPEG", quality=95)
-            else:
-                # If path or array
-                Image.fromarray(pil_image).save(img_disk_path, format="JPEG", quality=95)
-            saved_images_cache[img_id] = str(img_disk_path)
-
-        final_image_path = saved_images_cache[img_id]
-
-        user_content = USER_PROMPT_TEMPLATE.format(question=sample["question"])
-        assistant_content = ASSISTANT_RESPONSE_TEMPLATE.format(
-            relevance=sample["relevance"],
-            grounding=sample["grounding"],
-            answer=sample["answer"],
+        curated = apply_counterfactual_curation(
+            split_records=records,
+            image_paths_map=img_path_map,
+            positive_ratio=positive_ratio,
+            seed=seed,
         )
+        curated_splits[split_name] = curated
+        exported_paths[split_name] = export_split_jsonl(curated, split_name, output_dir)
 
-        record = {
-            "sample_id": sample_id,
-            "image_path": final_image_path,
-            "question": sample["question"],
-            "question_type": sample["question_type"],
-            "is_answerable": sample["is_answerable"],
-            "grounding": sample["grounding"],
-            "answer": sample["answer"],
-            "conversations": [
-                {"from": "user", "value": user_content},
-                {"from": "assistant", "value": assistant_content},
-            ],
-        }
-        exported_records.append(record)
-
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for r in exported_records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    print(f"[data_builder] Exported {len(exported_records)} samples to '{jsonl_path}'")
-    return jsonl_path
+    save_dataset_statistics_csv(curated_splits)
+    return exported_paths
 
 
 # ---------------------------------------------------------------------------
-# Pipeline Orchestrator
+# Main Orchestrator
 # ---------------------------------------------------------------------------
 
 def run_data_pipeline(
     config: ExperimentConfig,
     smoke_test: bool = False,
     hf_dataset_id: Optional[str] = None,
+    subset_size: Optional[int] = None,
     output_dir: str = "data",
+    max_workers: int = 16,
 ) -> Dict[str, Path]:
     """
-    End-to-end data processing workflow for Step 2 and Step 3.
+    Orchestrates dataset curation, strict image-level splitting, concurrent image download,
+    counterfactual curation, and multi-task JSONL export.
     """
-    target_hf_id = hf_dataset_id or config.dataset.name
-    out_dir_path = Path(output_dir)
-    out_dir_path.mkdir(parents=True, exist_ok=True)
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    target_repo = hf_dataset_id or config.dataset.name
+    if target_repo == "Bangla-Bayanno":
+        target_repo = DEFAULT_HF_REPO
+
+    target_subset = subset_size if subset_size is not None else config.dataset.subset_size
+    seed = config.dataset.seed
+    split_ratios = config.dataset.split_ratios
+    positive_ratio = config.dataset.positive_ratio
 
     print("==================================================================")
-    print(" Bangla VQA Data Pipeline: Counterfactual Curation & Multi-Task")
-    print("==================================================================")
-    print(f"  Target HF Dataset:    {target_hf_id}")
-    print(f"  Smoke Test Mode:      {smoke_test}")
-    print(f"  Subset Size:          {config.dataset.subset_size}")
-    print(f"  Split Ratios:         {config.dataset.split_ratios}")
-    print(f"  Positive Ratio:       {config.dataset.positive_ratio * 100:.1f}%")
-    print(f"  Negative (CF) Ratio:  {config.dataset.negative_counterfactual_ratio * 100:.1f}%")
-    print(f"  Random Seed:          {config.dataset.seed}")
-    print(f"  Output Directory:     {out_dir_path.resolve()}")
+    print(" Bangla-VQA Data Pipeline: Remian9080/Bangla-Bayanno")
+    print(f"  Target HF Repo:      {target_repo}")
+    print(f"  Smoke Test Mode:     {smoke_test}")
+    print(f"  Target Subset Size:  {target_subset}")
+    print(f"  Split Ratios:        {split_ratios}")
+    print(f"  Positive Ratio:      {positive_ratio * 100:.1f}%")
+    print(f"  Counterfactual %:    {config.dataset.negative_counterfactual_ratio * 100:.1f}%")
+    print(f"  Random Seed:         {seed}")
+    print(f"  Max Workers:         {max_workers}")
+    print(f"  Output Directory:    {out_path.resolve()}")
     print("==================================================================")
 
-    # 1. Load Data
+    # 1. Fast offline smoke-test branch
     if smoke_test:
-        raw_samples = generate_smoke_test_dataset(num_samples=100)
-    else:
-        raw_samples = load_huggingface_dataset(
-            hf_dataset_id=target_hf_id,
-            subset_size=config.dataset.subset_size,
+        return run_smoke_test_pipeline(
+            output_dir=out_path,
+            split_ratios=split_ratios,
+            positive_ratio=positive_ratio,
+            seed=seed,
         )
 
-    # 2. Strict Image-Level Splitting
-    split_dict = split_by_image(
-        samples=raw_samples,
-        split_ratios=config.dataset.split_ratios,
-        seed=config.dataset.seed,
+    # 2. Real data mode: download metadata JSONs
+    raw_records = load_bangla_bayanno_records(repo_id=target_repo)
+
+    # 3. Balanced subset selection by image_id
+    selected_records = select_balanced_image_subset(
+        records=raw_records,
+        target_subset_size=target_subset,
+        seed=seed,
     )
 
-    # 3. 70/30 Counterfactual Augmentation
-    augmented_splits: Dict[str, List[Dict[str, Any]]] = {}
-    for split_name, samples in split_dict.items():
-        print(f"[data_builder] Applying counterfactual curation to '{split_name}'...")
-        augmented = apply_counterfactual_augmentation(
-            split_samples=samples,
-            positive_ratio=config.dataset.positive_ratio,
-            seed=config.dataset.seed,
-        )
-        augmented_splits[split_name] = augmented
+    # 4. Strict 80/10/10 image-level split
+    split_dict = split_records_by_image(
+        records=selected_records,
+        split_ratios=split_ratios,
+        seed=seed,
+    )
 
-    # 4. Multi-Task Formatting & JSONL Export
+    # 5. Concurrent image downloading and counterfactual curation per split
+    curated_splits: Dict[str, List[Dict[str, Any]]] = {}
     exported_paths: Dict[str, Path] = {}
-    for split_name, samples in augmented_splits.items():
-        jsonl_file = format_and_export_split(
-            samples=samples,
+
+    for split_name in ["train", "val", "test"]:
+        records = split_dict[split_name]
+        image_path_map = download_images_for_split(
             split_name=split_name,
-            output_dir=out_dir_path,
+            split_records=records,
+            output_dir=out_path,
+            repo_id=target_repo,
+            max_workers=max_workers,
         )
-        exported_paths[split_name] = jsonl_file
-
-    # 5. Print Verification Statistics Table
-    print("\n==================================================================")
-    print(" DATASET CURATION SUMMARY STATISTICS")
-    print("==================================================================")
-    print(f"{'Split':<10} | {'Total':<8} | {'Positive':<10} | {'Counterfactual':<15} | {'Polar':<8} | {'Quant':<8} | {'Desc':<8}")
-    print("-" * 78)
-    for split_name, items in augmented_splits.items():
-        n_total = len(items)
-        n_pos = sum(1 for it in items if it["is_answerable"])
-        n_neg = sum(1 for it in items if not it["is_answerable"])
-        n_polar = sum(1 for it in items if it["question_type"] == "Polar")
-        n_quant = sum(1 for it in items if it["question_type"] == "Quantitative")
-        n_desc = sum(1 for it in items if it["question_type"] == "Descriptive")
-        print(
-            f"{split_name:<10} | {n_total:<8} | {n_pos:<10} | {n_neg:<15} | {n_polar:<8} | {n_quant:<8} | {n_desc:<8}"
+        curated = apply_counterfactual_curation(
+            split_records=records,
+            image_paths_map=image_path_map,
+            positive_ratio=positive_ratio,
+            seed=seed,
+            all_records=selected_records,
         )
-    print("==================================================================\n")
+        curated_splits[split_name] = curated
+        exported_paths[split_name] = export_split_jsonl(curated, split_name, out_path)
 
+    # 6. Save comprehensive dataset statistics CSV
+    save_dataset_statistics_csv(curated_splits)
     return exported_paths
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bangla VQA Counterfactual Data Builder")
-    parser.add_argument("--smoke_test", action="store_true", help="Generate 100 synthetic dummy samples for fast local testing")
-    parser.add_argument("--hf_dataset_id", type=str, default=None, help="Hugging Face dataset identifier")
-    parser.add_argument("--output_dir", type=str, default="data", help="Output directory for images and JSONL files")
+    parser = argparse.ArgumentParser(description="Bangla VQA Counterfactual Data Builder (Native HF Hub)")
+    parser.add_argument("--smoke_test", action="store_true", help="Generate fast local synthetic dataset (no downloads)")
+    parser.add_argument("--hf_dataset_id", type=str, default=DEFAULT_HF_REPO, help="HF Hub dataset repository")
+    parser.add_argument("--subset_size", type=int, default=None, help="Target QA subset size to curate (default: from config)")
+    parser.add_argument("--output_dir", type=str, default="data", help="Output directory")
+    parser.add_argument("--max_workers", type=int, default=16, help="Concurrent image download worker threads")
 
-    # Pass remaining args to config_loader
     args, unknown = parser.parse_known_args()
     config = load_config(cli_args=unknown)
 
@@ -740,7 +887,9 @@ def main():
         config=config,
         smoke_test=args.smoke_test,
         hf_dataset_id=args.hf_dataset_id,
+        subset_size=args.subset_size,
         output_dir=args.output_dir,
+        max_workers=args.max_workers,
     )
 
 

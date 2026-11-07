@@ -150,6 +150,7 @@ class TrainingConfig:
     fp16: bool = True
     logging_steps: int = 25
     output_dir: str = "./outputs/checkpoints"
+    single_task_baseline: bool = False
 
 
 @dataclass
@@ -204,6 +205,7 @@ def _build_flat_key_mapping():
         "fp16": ("training", "fp16", _str2bool),
         "logging_steps": ("training", "logging_steps", int),
         "output_dir": ("training", "output_dir", str),
+        "single_task_baseline": ("training", "single_task_baseline", _str2bool),
         # Decoding / VCD
         "use_vcd": ("decoding", "use_vcd", _str2bool),
         "vcd_alpha": ("decoding", "vcd_alpha", float),

@@ -1,0 +1,2 @@
+Model,Method,LoRA_r,Use_VCD,EM,Token_F1,ROUGE_L,Hallucination_Rate,CF_Accuracy
+Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task + VCD,16,True,0.0,0.0,0.0,0.0,0.0

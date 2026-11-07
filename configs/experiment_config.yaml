@@ -1,0 +1,48 @@
+# Hallucination-Resistant Bangla Visual Question Answering
+# Experiment Configuration
+
+dataset:
+  name: "Bangla-Bayanno"
+  subset_size: 10000
+  positive_ratio: 0.70
+  negative_counterfactual_ratio: 0.30
+  seed: 42
+  split_ratios:
+    - 0.8
+    - 0.1
+    - 0.1
+
+model:
+  base_model_id: "Qwen/Qwen2-VL-2B-Instruct"
+  backup_model_id: "google/paligemma-3b-pt-224"
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  num_train_epochs: 3
+  fp16: true
+  logging_steps: 25
+  output_dir: "./outputs/checkpoints"
+
+decoding:
+  use_vcd: true
+  vcd_alpha: 1.0
+  vcd_beta: 0.1
+  noise_step: 500

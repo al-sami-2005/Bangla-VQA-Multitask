@@ -1,0 +1,38 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+
+# OS specific files
+.DS_Store
+
+# Datasets and raw data
+data/
+datasets/
+
+# Checkpoints and large artifacts
+outputs/checkpoints/
+checkpoints/
+wandb/
+runs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Explicitly track results CSVs and keep directory structure
+!outputs/
+!outputs/results/
+!outputs/results/**
+outputs/results/*
+!outputs/results/*.csv
+!outputs/results/.gitkeep

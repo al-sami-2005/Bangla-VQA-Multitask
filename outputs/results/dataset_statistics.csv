@@ -1,0 +1,5 @@
+Split,Unique_Images,Total_Samples,Positive_Samples,Counterfactual_Samples,Polar,Quantitative,Descriptive
+train,824,8234,5780,2454,2276,917,5041
+val,103,943,659,284,237,101,605
+test,103,831,583,248,240,85,506
+Total,1030,10008,7022,2986,2753,1103,6152

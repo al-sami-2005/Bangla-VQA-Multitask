@@ -1,0 +1,2 @@
+Run_Name,Model,Method,Use_VCD,Total_Samples,Answerability_Acc,Answerability_F1,Hallucination_Rate,EM,Token_F1,ROUGE_L
+demo_run,Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task,False,5,100.0,100.0,0.0,100.0,100.0,100.0

@@ -1,14 +1,18 @@
 """
-Multimodal Dataset Loader & Data Collator for Qwen2-VL
+Multimodal Dataset Loader & Data Collator for Qwen2-VL-2B-Instruct
 Paper: Hallucination-Resistant Bangla Visual Question Answering via Counterfactual Multi-Task Instruction Tuning
 
-Core Components:
-1. BanglaMultitaskVQADataset: PyTorch Dataset loading JSONL records and PIL RGB images.
-   Formats multimodal chat structures compatible with Qwen2-VL-2B-Instruct processor (AutoProcessor).
-   Includes `--single_task_baseline` option stripping out প্রাসঙ্গিকতা and ভিজ্যুয়াল প্রমাণ
-   to train solely on 'চূড়ান্ত উত্তর: {answer}'.
-2. BanglaVQADataCollator: Multimodal collator applying Qwen2-VL chat templates and prompt masking (-100).
-3. build_dataloaders: Multi-split factory for Train, Validation, and Test loaders.
+Core Responsibilities:
+1. BanglaMultitaskVQADataset:
+   - Reads data/train.jsonl, data/val.jsonl, data/test.jsonl.
+   - Loads RGB PIL image from image_path.
+   - Prepares multimodal conversation message format compatible with Qwen2-VL processor.
+   - Supports --single_task_baseline to strip out প্রাসঙ্গিকতা and ভিজ্যুয়াল প্রমাণ
+     and train solely on 'চূড়ান্ত উত্তর: {answer}'.
+2. Qwen2VLDataCollator:
+   - Collate multimodal batches using AutoProcessor and qwen_vl_utils.process_vision_info.
+   - Masks prompt tokens and padding with -100 in labels so loss is strictly computed
+     on the assistant response.
 """
 
 import argparse
@@ -25,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config_loader import ExperimentConfig, load_config
 
-# Optional PyTorch import with graceful fallback
+# Optional PyTorch & Hugging Face imports
 try:
     import torch
     from torch.utils.data import DataLoader, Dataset
@@ -54,7 +58,7 @@ MULTITASK_ASSISTANT_RESPONSE = (
     "চূড়ান্ত উত্তর: {answer}"
 )
 
-# Single-task baseline templates (ablation)
+# Single-task baseline templates
 SINGLE_TASK_USER_PROMPT = (
     "<image>\n"
     "প্রশ্ন: {question}\n"
@@ -75,9 +79,9 @@ class BanglaMultitaskVQADataset(Dataset):
     Features:
     - Reads curated JSONL files (train.jsonl, val.jsonl, test.jsonl).
     - Loads images as PIL Images in RGB format.
-    - Prepares multimodal conversation dictionaries compatible with Qwen2-VL processor.
-    - Supports `single_task_baseline=True` to strip out 'প্রাসঙ্গিকতা' and 'ভিজ্যুয়াল প্রমাণ',
-      training exclusively on 'চূড়ান্ত উত্তর: {answer}'.
+    - Prepares multimodal conversation format for Qwen2-VL-2B-Instruct.
+    - If single_task_baseline=True: sets assistant target to only 'চূড়ান্ত উত্তর: {answer}'.
+      Otherwise uses the full 3-line target ('প্রাসঙ্গিকতা', 'ভিজ্যুয়াল প্রমাণ', 'চূড়ান্ত উত্তর').
     """
 
     def __init__(
@@ -85,13 +89,15 @@ class BanglaMultitaskVQADataset(Dataset):
         jsonl_path: str,
         image_base_dir: Optional[str] = None,
         single_task_baseline: bool = False,
-        processor: Optional[Any] = None,
+        min_pixels: int = 256 * 28 * 28,
+        max_pixels: int = 512 * 28 * 28,
         max_seq_length: int = 1024,
     ):
         self.jsonl_path = Path(jsonl_path)
         self.image_base_dir = Path(image_base_dir) if image_base_dir else self.jsonl_path.parent
         self.single_task_baseline = bool(single_task_baseline)
-        self.processor = processor
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
         self.max_seq_length = max_seq_length
         self.samples: List[Dict[str, Any]] = []
 
@@ -155,7 +161,7 @@ class BanglaMultitaskVQADataset(Dataset):
         if self.single_task_baseline:
             # Strip out প্রাসঙ্গিকতা and ভিজ্যুয়াল প্রমাণ; train ONLY on চূড়ান্ত উত্তর: {answer}
             user_val = SINGLE_TASK_USER_PROMPT.format(question=question)
-            assistant_val = SINGLE_TASK_ASSISTANT_RESPONSE.format(answer=answer)
+            assistant_val = f"চূড়ান্ত উত্তর: {answer}"
             grounding_field = ""
         else:
             # Multi-Task instruction format
@@ -191,7 +197,7 @@ class BanglaMultitaskVQADataset(Dataset):
         ]
 
         return {
-            "sample_id": record["sample_id"],
+            "sample_id": record.get("sample_id", f"sample_{idx:05d}"),
             "image": pil_image,
             "image_path": str(img_path),
             "question": question,
@@ -206,19 +212,20 @@ class BanglaMultitaskVQADataset(Dataset):
         }
 
 
-# Backward compatibility alias
+# Compatibility alias
 BanglaVQADataset = BanglaMultitaskVQADataset
 
 
 # ---------------------------------------------------------------------------
-# Multimodal Data Collator for Qwen2-VL
+# Qwen2VLDataCollator
 # ---------------------------------------------------------------------------
 
-class BanglaVQADataCollator:
+class Qwen2VLDataCollator:
     """
     Multimodal Data Collator for Qwen2-VL-2B-Instruct.
-    Applies model chat templates, tokenizes prompt + assistant responses,
-    and applies label masking (-100) to ignore user prompt tokens in the loss.
+    Uses AutoProcessor and qwen_vl_utils.process_vision_info to format vision tokens
+    and text, masking all prompt and padding tokens with -100 in labels so loss is
+    strictly computed on the assistant response.
     """
 
     def __init__(
@@ -245,30 +252,28 @@ class BanglaVQADataCollator:
                 has_qwen_utils = False
 
             batch_texts = []
-            batch_images = []
             prompt_only_texts = []
+            all_messages = []
 
             for sample in batch:
                 messages = sample["qwen_messages"]
+                all_messages.append(messages)
 
-                # Complete dialogue text (prompt + target)
+                # Format full conversation (user + assistant)
                 full_text = self.processor.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=False
                 )
-                # Prompt boundary text for loss masking
+                # Format prompt only (to compute prefix length for -100 label masking)
                 prompt_text = self.processor.apply_chat_template(
                     messages[:1], tokenize=False, add_generation_prompt=True
                 )
 
                 batch_texts.append(full_text)
-                batch_images.append(sample["image"])
                 prompt_only_texts.append(prompt_text)
 
-            # Process vision and text
+            # Process vision info
             if has_qwen_utils:
-                image_inputs, video_inputs = process_vision_info(
-                    [m for sample in batch for m in sample["qwen_messages"]]
-                )
+                image_inputs, video_inputs = process_vision_info(all_messages)
                 inputs = self.processor(
                     text=batch_texts,
                     images=image_inputs,
@@ -277,6 +282,7 @@ class BanglaVQADataCollator:
                     return_tensors="pt",
                 )
             else:
+                batch_images = [s["image"] for s in batch]
                 inputs = self.processor(
                     text=batch_texts,
                     images=batch_images,
@@ -284,7 +290,7 @@ class BanglaVQADataCollator:
                     return_tensors="pt",
                 )
 
-            # Mask labels: set prompt tokens to -100 so loss evaluates only on assistant target
+            # Mask labels: set prompt tokens and padding to -100
             labels = inputs["input_ids"].clone()
             tokenizer = getattr(self.processor, "tokenizer", self.processor)
 
@@ -293,15 +299,14 @@ class BanglaVQADataCollator:
                 prompt_len = len(p_tokens)
                 labels[i, :prompt_len] = -100
 
-            # Ignore padding tokens in loss
+            # Ignore padding tokens in loss calculation
             if "attention_mask" in inputs:
                 labels[inputs["attention_mask"] == 0] = -100
 
             inputs["labels"] = labels
-            inputs["single_task_baseline"] = self.single_task_baseline
             return inputs
 
-        # Lightweight / local test collation (runs without HF model weights or GPU)
+        # Fallback for CPU / local development without GPU or HF weights
         return {
             "sample_ids": [s["sample_id"] for s in batch],
             "images": [s["image"] for s in batch],
@@ -315,16 +320,31 @@ class BanglaVQADataCollator:
         }
 
 
+# Compatibility alias
+BanglaVQADataCollator = Qwen2VLDataCollator
+
+
 # ---------------------------------------------------------------------------
 # Processor & DataLoader Factory
 # ---------------------------------------------------------------------------
 
-def get_processor(model_id: str = "Qwen/Qwen2-VL-2B-Instruct") -> Optional[Any]:
-    """Loads AutoProcessor for Qwen2-VL."""
-    print(f"[dataset_loader] Attempting to load AutoProcessor for '{model_id}'...")
+def get_processor(
+    model_id: str = "Qwen/Qwen2-VL-2B-Instruct",
+    min_pixels: int = 256 * 28 * 28,
+    max_pixels: int = 512 * 28 * 28,
+) -> Optional[Any]:
+    """
+    Loads AutoProcessor configured for Qwen2-VL-2B-Instruct with resolution bounds.
+    """
+    print(f"[dataset_loader] Attempting to load AutoProcessor for '{model_id}' (min_pixels={min_pixels}, max_pixels={max_pixels})...")
     try:
         from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            trust_remote_code=True,
+        )
         print(f"[dataset_loader] Successfully loaded AutoProcessor for '{model_id}'.")
         return processor
     except Exception as e:
@@ -340,8 +360,7 @@ def build_dataloaders(
     single_task_baseline: Optional[bool] = None,
 ) -> Tuple[Any, Any, Any]:
     """
-    Builds Train, Validation, and Test DataLoaders.
-    Respects `single_task_baseline` from argument or config.training.single_task_baseline.
+    Constructs Train, Validation, and Test PyTorch DataLoaders.
     """
     if single_task_baseline is None:
         single_task_baseline = getattr(config.training, "single_task_baseline", False)
@@ -351,7 +370,6 @@ def build_dataloaders(
     val_jsonl = data_path / "val.jsonl"
     test_jsonl = data_path / "test.jsonl"
 
-    # Automatically generate smoke test if data files are missing
     if not (train_jsonl.is_file() and val_jsonl.is_file() and test_jsonl.is_file()):
         print(f"[dataset_loader] JSONL files not found in '{data_dir}'. Generating smoke-test dataset...")
         from src.data_builder import run_data_pipeline
@@ -360,20 +378,17 @@ def build_dataloaders(
     train_ds = BanglaMultitaskVQADataset(
         jsonl_path=str(train_jsonl),
         single_task_baseline=single_task_baseline,
-        processor=processor,
     )
     val_ds = BanglaMultitaskVQADataset(
         jsonl_path=str(val_jsonl),
         single_task_baseline=single_task_baseline,
-        processor=processor,
     )
     test_ds = BanglaMultitaskVQADataset(
         jsonl_path=str(test_jsonl),
         single_task_baseline=single_task_baseline,
-        processor=processor,
     )
 
-    collator = BanglaVQADataCollator(
+    collator = Qwen2VLDataCollator(
         processor=processor,
         model_id=config.model.base_model_id,
         single_task_baseline=single_task_baseline,
@@ -434,7 +449,7 @@ def main():
     config = load_config(cli_args=unknown)
 
     print("==================================================================")
-    print(" Verifying BanglaMultitaskVQADataset & Qwen2-VL Compatibility")
+    print(" Verifying BanglaMultitaskVQADataset & Qwen2VLDataCollator")
     print(f" Single-Task Baseline Mode: {args.single_task_baseline}")
     print("==================================================================")
 
@@ -443,13 +458,11 @@ def main():
         from src.data_builder import run_data_pipeline
         run_data_pipeline(config, smoke_test=True, output_dir=args.data_dir)
 
-    # 1. Instantiate BanglaMultitaskVQADataset
     dataset = BanglaMultitaskVQADataset(
         jsonl_path=str(jsonl_file),
         single_task_baseline=args.single_task_baseline,
     )
 
-    # 2. Inspect Sample 0
     sample0 = dataset[0]
     print(f"\n[dataset_loader] Successfully fetched Sample 0:")
     print(f"  Sample ID:             {sample0['sample_id']}")
@@ -464,14 +477,7 @@ def main():
     print(sample0["conversations"][1]["value"])
     print("-" * 50)
 
-    print("\n[dataset_loader] Qwen2-VL Processor Message Structure:")
-    for turn in sample0["qwen_messages"]:
-        role = turn["role"]
-        content_preview = [c["type"] for c in turn["content"]]
-        print(f"  Turn [{role}]: content types -> {content_preview}")
-
-    # 3. Test Collator
-    collator = BanglaVQADataCollator(single_task_baseline=args.single_task_baseline)
+    collator = Qwen2VLDataCollator(single_task_baseline=args.single_task_baseline)
     mini_batch = [dataset[0], dataset[1]]
     collated = collator(mini_batch)
     print(f"\n[dataset_loader] Collated batch of size {collated['batch_size']}:")
@@ -479,8 +485,6 @@ def main():
     print(f"  Response 0: {repr(collated['responses'][0])}")
     print(f"  Response 1: {repr(collated['responses'][1])}")
 
-    # 4. Test DataLoader factory
-    print("\n[dataset_loader] Testing build_dataloaders factory:")
     build_dataloaders(config=config, data_dir=args.data_dir, single_task_baseline=args.single_task_baseline)
     print("==================================================================\n")
 

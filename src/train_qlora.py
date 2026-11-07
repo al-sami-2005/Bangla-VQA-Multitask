@@ -205,7 +205,7 @@ def train_qlora(
         save_strategy="no" if max_steps > 0 and max_steps <= 100 else "steps",
         save_steps=50,
         save_total_limit=1,
-        evaluation_strategy="no" if val_dataset is None else "steps",
+        eval_strategy="no" if val_dataset is None else "steps",
         eval_steps=50 if val_dataset is not None else None,
         dataloader_pin_memory=False,
         remove_unused_columns=False,  # CRITICAL: keep image tensors in batch

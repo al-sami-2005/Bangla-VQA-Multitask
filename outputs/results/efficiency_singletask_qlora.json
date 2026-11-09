@@ -1,0 +1,13 @@
+{
+  "run_name": "singletask_qlora_full",
+  "base_model": "Qwen/Qwen2-VL-2B-Instruct",
+  "single_task_baseline": true,
+  "trainable_parameters": 18464768,
+  "total_parameters": 2227450368,
+  "trainable_percent": 0.829,
+  "peak_gpu_vram_gb": 11.69,
+  "elapsed_time_sec": 2450.0,
+  "train_loss": 5.3518,
+  "num_train_epochs": 1.0,
+  "max_steps": -1
+}

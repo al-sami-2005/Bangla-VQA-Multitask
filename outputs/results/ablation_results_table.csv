@@ -1,2 +1,4 @@
-Run_Name,Model,Method,Use_VCD,Total_Samples,Answerability_Acc,Answerability_F1,Hallucination_Rate,EM,Token_F1,ROUGE_L
-demo_run,Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task,False,5,100.0,100.0,0.0,100.0,100.0,100.0
+Run_Name,Model,Method,Use_VCD,Total_Steps,Train_Loss,Val_Loss,VRAM_GB,Relative_Val_Loss_Reduction
+singletask_qlora_baseline,Qwen/Qwen2-VL-2B-Instruct,Single-Task Baseline (Direct Answer),False,511,5.35,5.47,11.69,Baseline
+multitask_qlora_full,Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task (Relevance + Grounding + Answer),False,511,3.29,3.54,11.69,-35.2%
+multitask_qlora_vcd,Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task + Visual Contrastive Decoding (VCD),True,511,3.29,3.54,11.69,-35.2%

@@ -28,11 +28,18 @@ runs/
 *.pth
 *.bin
 *.safetensors
+*.zip
+kaggle/
+kaggle*/
+kaggle 2/
 
-# Explicitly track results CSVs and keep directory structure
+# Explicitly track results artifacts, plots, and keep directory structure
 !outputs/
 !outputs/results/
 !outputs/results/**
 outputs/results/*
 !outputs/results/*.csv
+!outputs/results/*.json
+!outputs/results/*.png
+!outputs/results/*.md
 !outputs/results/.gitkeep

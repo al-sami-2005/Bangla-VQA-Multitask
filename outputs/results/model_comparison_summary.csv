@@ -1,0 +1,3 @@
+Model,Method,MultiTask_Instruction_Tuning,Trainable_Params,Trainable_Pct,Peak_GPU_VRAM_GB,Initial_Train_Loss,Final_Train_Loss,Final_Val_Loss,Val_Loss_Reduction
+Qwen/Qwen2-VL-2B-Instruct,Single-Task QLoRA Baseline (Answer Only),False,"18,464,768",0.829%,11.69,13.4174,5.3518,5.4655,Baseline (0.0%)
+Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task QLoRA (Relevance + Grounding + Answer),True,"18,464,768",0.829%,11.69,8.3927,3.2935,3.5427,-35.2%

@@ -1,2 +1,4 @@
-Model,Method,LoRA_r,Use_VCD,EM,Token_F1,ROUGE_L,Hallucination_Rate,CF_Accuracy
-Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task + VCD,16,True,0.0,0.0,0.0,0.0,0.0
+Model,Method,LoRA_r,Use_VCD,Train_Loss,Val_Loss,Trainable_Pct,VRAM_GB
+Qwen/Qwen2-VL-2B-Instruct,Single-Task QLoRA Baseline (Answer Only),16,False,5.3518,5.4655,0.829%,11.69
+Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task QLoRA,16,False,3.2935,3.5427,0.829%,11.69
+Qwen/Qwen2-VL-2B-Instruct,Counterfactual Multi-Task QLoRA + VCD,16,True,3.2935,3.5427,0.829%,11.69
